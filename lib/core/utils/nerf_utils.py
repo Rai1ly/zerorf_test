@@ -14,7 +14,7 @@ def custom_meshgrid(*args):
         return torch.meshgrid(*args, indexing='ij')
 
 
-def get_ray_directions(h, w, intrinsics, norm=False, device=None):
+def get_ray_directions(h, w, intrinsics,rectify_convention=True ,norm=False, device=None):
     """
     Args:
         h (int)
@@ -28,11 +28,20 @@ def get_ray_directions(h, w, intrinsics, norm=False, device=None):
     x = torch.linspace(0.5, w - 0.5, w, device=device)
     y = torch.linspace(0.5, h - 0.5, h, device=device)
     # (*, h, w, 2)
-    directions_xy = torch.stack(
-        [((x - intrinsics[..., 2:3]) / intrinsics[..., 0:1])[..., None, :].expand(*batch_size, h, w),
-         ((y - intrinsics[..., 3:4]) / intrinsics[..., 1:2])[..., :, None].expand(*batch_size, h, w)], dim=-1)
+    if rectify_convention:
+        directions_xy = torch.stack(
+            [((x - intrinsics[..., 2:3]) / intrinsics[..., 0:1])[..., None, :].expand(*batch_size, h, w),
+            (-(y - intrinsics[..., 3:4]) / intrinsics[..., 1:2])[..., :, None].expand(*batch_size, h, w)], dim=-1)
+    else:
+        directions_xy = torch.stack(
+            [((x - intrinsics[..., 2:3]) / intrinsics[..., 0:1])[..., None, :].expand(*batch_size, h, w),
+            ((y - intrinsics[..., 3:4]) / intrinsics[..., 1:2])[..., :, None].expand(*batch_size, h, w)], dim=-1)
     # (*, h, w, 3)
-    directions = F.pad(directions_xy, [0, 1], mode='constant', value=1.0)
+    if rectify_convention:
+
+        directions = F.pad(directions_xy, [0, 1], mode='constant', value=-1.0)
+    else:
+        directions=F.pad(directions_xy, [0, 1], mode='constant', value=1.0)
     if norm:
         directions = F.normalize(directions, dim=-1)
     return directions
@@ -54,9 +63,9 @@ def get_rays(directions, c2w, norm=False):
     return rays_o, rays_d
 
 
-def get_cam_rays(c2w, intrinsics, h, w):
+def get_cam_rays(c2w, intrinsics, h, w, rectify_convention=False):
     directions = get_ray_directions(
-        h, w, intrinsics, norm=False, device=intrinsics.device)  # (num_scenes, num_imgs, h, w, 3)
+        h, w, intrinsics,rectify_convention=rectify_convention ,norm=False, device=intrinsics.device)  # (num_scenes, num_imgs, h, w, 3)
     rays_o, rays_d = get_rays(directions, c2w, norm=True)
     return rays_o, rays_d
 

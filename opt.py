@@ -9,7 +9,8 @@ def config_parser(cmd=None):
                         help='experiment name')
     parser.add_argument("--wandb-project", type=str, 
                         default="zerorf", help='wandb project name')
-    
+    parser.add_argument("--micro_object", action='store_true',help='if reconstrction the small object.')
+    parser.add_argument("--enable_dense_depth",action='store_true')
     # data
     parser.add_argument("--dataset", type=str, 
                         default="nerf_syn", help='type of dataset')
@@ -19,7 +20,7 @@ def config_parser(cmd=None):
                         default="chair", help='object name')
     parser.add_argument("--n-views", type=int, 
                         default=6, help='number of input views')
-    
+    parser.add_argument('--rectify_convention', action='store_true', help='if rectify the convention')
     # model
     parser.add_argument("--model-res", type=int, 
                         default=20, help='noise resolution (should be about 1/40 the provided image resolution), ignored when load-image is set')
@@ -34,7 +35,7 @@ def config_parser(cmd=None):
                         default=1.0, help='background color')
     parser.add_argument("--rep", type=str, choices=['dif', 'tensorf'],
                         default="dif", help="representation to use")
-    
+    parser.add_argument("--sdf_mode",action='store_true',help='if use sdf')
     # training
     parser.add_argument("--net-lr", type=float, 
                         default=0.002, help='learning rate')

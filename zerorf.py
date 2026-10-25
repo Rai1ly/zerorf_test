@@ -18,6 +18,8 @@ from lib.core.optimizer import build_optimizers
 from lib.core.ssdnerf_gui import OrbitCamera
 from lib.datasets.nerf_synthetic import NerfSynthetic
 from lib.datasets.oppo import OppoDataset
+from lib.datasets.custom import CustomDataset
+from lib.datasets.custom import ColmapDataset
 from PIL import Image
 import einops
 from opt import config_parser
@@ -89,14 +91,45 @@ if not args.load_image:
             selected_idxs = [10, 33, 35, 6]
         else:
             selected_idxs = kmeans_downsample(entry['cond_poses'][..., :3, 3], args.n_views)
-    
-    data_entry = dict(
-        cond_imgs=torch.tensor(entry['cond_imgs'][selected_idxs][None]).float().to(device),
-        cond_poses=torch.tensor(entry['cond_poses'])[selected_idxs][None].float().to(device),
-        cond_intrinsics=torch.tensor(entry['cond_intrinsics'])[selected_idxs][None].float().to(device),
-        scene_id=[0],
-        scene_name=[args.proj_name]
-    )
+    elif args.dataset == 'custom':
+        world_scale = 1.0
+        dataset = CustomDataset(f"{args.data_dir}", split='train', world_scale=world_scale, rgba=True,n_views=args.n_views)
+        val = CustomDataset(f"{args.data_dir}", split='val', world_scale=world_scale,n_views=args.n_views)
+        test = CustomDataset(f"{args.data_dir}", split='val', world_scale=world_scale,n_views=args.n_views)
+        entry = dataset[0]
+        # if args.n_views == 6:
+        #     selected_idxs = [0, 1, 2, 3, 4, 5]
+        # elif args.n_views == 5:
+        #     selected_idxs = [0, 1, 2, 3, 4]
+        selected_idxs = [i for i in range(args.n_views)]
+    elif args.dataset == 'colmap':
+        world_scale = 1.0
+        dataset = ColmapDataset(f"{args.data_dir}", split='train', world_scale=world_scale, rgba=True)
+        val = ColmapDataset(f"{args.data_dir}", split='val', world_scale=world_scale)
+        test = ColmapDataset(f"{args.data_dir}", split='val', world_scale=world_scale)
+        entry = dataset[0]
+        # if args.n_views==8:
+        #     selected_idxs=[0,1,2,3,4,5,6,7]
+        # else:
+        #     selected_idxs = kmeans_downsample(entry['cond_poses'][...,:3,3], args.n_views)
+        selected_idxs = [i for i in range(16)]
+    if args.enable_dense_depth:
+        data_entry = dict(
+            cond_imgs=torch.tensor(entry['cond_imgs'][selected_idxs][None]).float().to(device),
+            cond_depth=torch.tensor(entry['cond_depth'][selected_idxs][None]).float().to(device),
+            cond_poses=torch.tensor(entry['cond_poses'])[selected_idxs][None].float().to(device),
+            cond_intrinsics=torch.tensor(entry['cond_intrinsics'])[selected_idxs][None].float().to(device),
+            scene_id=[0],
+            scene_name=[args.proj_name]
+        )
+    else:
+        data_entry = dict(
+            cond_imgs=torch.tensor(entry['cond_imgs'][selected_idxs][None]).float().to(device),
+            cond_poses=torch.tensor(entry['cond_poses'])[selected_idxs][None].float().to(device),
+            cond_intrinsics=torch.tensor(entry['cond_intrinsics'])[selected_idxs][None].float().to(device),
+            scene_id=[0],
+            scene_name=[args.proj_name]
+        )
     entry = val[0]
     val_entry = dict(
         test_imgs=torch.tensor(entry['cond_imgs'][:args.n_val][None]).float().to(device),
@@ -143,13 +176,13 @@ decoder_1 = dict(
     reduce='cat',
     separate_density_and_color=False,
     sh_coef_only=False,
-    sdf_mode=False,
+    sdf_mode=args.sdf_mode,
     max_steps=1024 if not args.load_image else 320,
     n_images=args.n_views,
     image_h=pic_h,
     image_w=pic_w,
     has_time_dynamics=False,
-    visualize_mesh=False
+    visualize_mesh=True
 )
 decoder_2 = dict(
     type='FreqFactorizedDecoder',
@@ -190,10 +223,15 @@ nerf: MultiSceneNeRF = build_model(dict(
         type='MSELoss',
         loss_weight=3.2
     ),
+    depth_loss=dict(
+        type='MSELoss',
+        loss_weight=1
+    ),
     use_lpips_metric=torch.cuda.mem_get_info()[1] // 1000 ** 3 >= 32,
     cache_size=1,
     cache_16bit=False,
-    init_from_mean=True
+    init_from_mean=True,
+    sdf_mode = args.sdf_mode
 ), train_cfg = dict(
     dt_gamma_scale=0.5,
     density_thresh=0.05,
@@ -237,7 +275,7 @@ prog = tqdm.trange(args.n_iters)
 best_psnr = 0.0
 
 for j in prog:
-    lv = nerf.train_step(data_entry, optim)['log_vars']
+    lv = nerf.train_step(data_entry, optim, args=args)['log_vars']
     lr_sched.step()
     lv.pop('code_rms')
     lv.pop('loss')
@@ -251,6 +289,8 @@ for j in prog:
         nerf.train_cfg['n_decoder_rays'] = args.n_rays_up
     if j % args.val_iter == args.val_iter - 1:
         cam = OrbitCamera('final', pic_w, pic_h, 3.2, 48)
+        if args.dataset == 'custom':
+            print(f'[INFO] use the interpolate camera pos')
         cache = nerf.cache[0]
         nerf.eval()
         if not args.load_image:
@@ -274,7 +314,14 @@ for j in prog:
             out = cv2.VideoWriter('dec_%d.avi' % j, cv2.VideoWriter_fourcc(*'MJPG'), 24.0, (pic_w, pic_h))
             with torch.no_grad():
                 for i in tqdm.trange(60, desc='%.2f' % best_psnr):
-                    test_pose = cam.pose
+                    if args.dataset == 'custom':
+                        test_pose = dataset.interpolate_dense_poses[i]
+                    elif args.dataset == 'colmap':
+                        test_pose = dataset.poses[i % 8]
+                    elif args.micro_object:
+                        test_pose = dataset.poses[0] if (i % 2) == 0 else dataset.poses[1]
+                    else:
+                        test_pose = cam.pose
                     test_intrinsic = cam.intrinsics
                     if args.dataset == "oi":
                         revert_y = numpy.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])

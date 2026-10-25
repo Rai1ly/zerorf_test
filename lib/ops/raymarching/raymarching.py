@@ -313,7 +313,7 @@ def march_rays_train(
 class _composite_rays_train(Function):
     @staticmethod
     @custom_fwd(cast_inputs=torch.float32)
-    def forward(ctx, sigmas, rgbs, ts, rays, T_thresh=1e-4, binarize=False):
+    def forward(ctx, sigmas, rgbs, ts, rays, T_thresh=1e-4, alpha_mode=False):
         ''' composite rays' rgbs, according to the ray marching formula.
         Args:
             rgbs: float, [M, 3]
@@ -339,11 +339,11 @@ class _composite_rays_train(Function):
         depth = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
         image = torch.empty(N, 3, dtype=sigmas.dtype, device=sigmas.device)
 
-        get_backend().composite_rays_train_forward(sigmas, rgbs, ts, rays, M, N, T_thresh, binarize, weights,
+        get_backend().composite_rays_train_forward(sigmas, rgbs, ts, rays, M, N, T_thresh, alpha_mode, weights,
                                                    weights_sum, depth, image)
 
         ctx.save_for_backward(sigmas, rgbs, ts, rays, weights_sum, depth, image)
-        ctx.dims = [M, N, T_thresh, binarize]
+        ctx.dims = [M, N, T_thresh, alpha_mode]
 
         return weights, weights_sum, depth, image
 
@@ -356,13 +356,13 @@ class _composite_rays_train(Function):
         grad_image = grad_image.contiguous()
 
         sigmas, rgbs, ts, rays, weights_sum, depth, image = ctx.saved_tensors
-        M, N, T_thresh, binarize = ctx.dims
+        M, N, T_thresh, alpha_mode = ctx.dims
 
         grad_sigmas = torch.zeros_like(sigmas)
         grad_rgbs = torch.zeros_like(rgbs)
 
         get_backend().composite_rays_train_backward(grad_weights, grad_weights_sum, grad_depth, grad_image, sigmas,
-                                                    rgbs, ts, rays, weights_sum, depth, image, M, N, T_thresh, binarize,
+                                                    rgbs, ts, rays, weights_sum, depth, image, M, N, T_thresh, alpha_mode,
                                                     grad_sigmas, grad_rgbs)
 
         return grad_sigmas, grad_rgbs, None, None, None, None
@@ -376,7 +376,7 @@ def all_equal(iterable):
     return next(g, True) and not next(g, False)
 
 
-def batch_composite_rays_train(sigmas, rgbs, ts, rays, num_points, T_thresh=1e-4, binarize=False):
+def batch_composite_rays_train(sigmas, rgbs, ts, rays, num_points, T_thresh=1e-4, alpha_mode=False):
     """
     Args:
         sigmas: (num_all_points,)
@@ -409,7 +409,7 @@ def batch_composite_rays_train(sigmas, rgbs, ts, rays, num_points, T_thresh=1e-4
             num_rays.append(num_rays_per_scene)
         rays_ = torch.cat(rays_, dim=0)
 
-        weights, weights_sum_, depth_, image_ = composite_rays_train(sigmas, rgbs, ts_, rays_, T_thresh, binarize)
+        weights, weights_sum_, depth_, image_ = composite_rays_train(sigmas, rgbs, ts_, rays_, T_thresh, alpha_mode)
         if all_equal(num_rays):
             weights_sum = weights_sum_.reshape(num_scenes, num_rays[0])
             depth = depth_.reshape(num_scenes, num_rays[0])
@@ -420,7 +420,7 @@ def batch_composite_rays_train(sigmas, rgbs, ts, rays, num_points, T_thresh=1e-4
             image = image_.split(num_rays, dim=0)
 
     else:
-        weights, weights_sum, depth, image = composite_rays_train(sigmas, rgbs, ts[0], rays[0], T_thresh, binarize)
+        weights, weights_sum, depth, image = composite_rays_train(sigmas, rgbs, ts[0], rays[0], T_thresh, alpha_mode)
         weights_sum = weights_sum[None]
         depth = depth[None]
         image = image[None]
@@ -494,7 +494,7 @@ class _composite_rays(Function):
     @staticmethod
     @custom_fwd(cast_inputs=torch.float32)  # need to cast sigmas & rgbs to float
     def forward(ctx, n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, ts, weights_sum, depth, image, T_thresh=1e-2,
-                binarize=False):
+                alpha_mode=False):
         ''' composite rays' rgbs, according to the ray marching formula. (for inference)
         Args:
             n_alive: int, number of alive rays
@@ -511,14 +511,14 @@ class _composite_rays(Function):
         '''
         sigmas = sigmas.float().contiguous()
         rgbs = rgbs.float().contiguous()
-        get_backend().composite_rays(n_alive, n_step, T_thresh, binarize, rays_alive, rays_t, sigmas, rgbs, ts,
+        get_backend().composite_rays(n_alive, n_step, T_thresh, alpha_mode, rays_alive, rays_t, sigmas, rgbs, ts,
                                      weights_sum, depth, image)
         return tuple()
 
 
 def composite_rays(
         n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, ts, weights_sum, depth, image, T_thresh=1e-2,
-        binarize=False):
+        alpha_mode=False):
     return _composite_rays.apply(
         n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, ts, weights_sum, depth, image, T_thresh,
-        binarize)
+        alpha_mode)

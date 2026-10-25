@@ -38,6 +38,7 @@ class MultiSceneNeRF(BaseNeRF):
                  cache_size=0,  # cache in RAM, top priority
                  cache_16bit=False,
                  num_file_writers=0,  # cache in file system (for large dataset)
+                 sdf_mode=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -54,7 +55,9 @@ class MultiSceneNeRF(BaseNeRF):
 
         self.num_file_writers = num_file_writers
         self.is_file_writers_initialized = False
-
+        self.global_step = 0
+        ### init for sdf_mode
+        self.init_sdf_mode = sdf_mode
     def init_file_writers(self, save_dir):
         if self.num_file_writers > 0:
             def file_writer(queue):
@@ -193,18 +196,31 @@ class MultiSceneNeRF(BaseNeRF):
                         out_dict_to(out, device='cpu', code_dtype=code_dtype, optimizer_dtype=optimizer_dtype),
                         os.path.join(save_dir, scene_name + '.pth'))
 
-    def train_step(self, data, optimizer, running_status=None):
+    def train_step(self, data, optimizer,args=None,running_status=None):
         code_list_, code_optimizers, density_grid, density_bitfield = self.load_cache(data)
+        # self.decoder.global_step += 1
+        ### init_double_sphere ###
+        if args.sdf_mode and self.init_sdf_mode:
+            self.init_sdf_mode = False
+            # self.decoder.init_double_sphere()
+            self.decoder.preprocessor_needs_jit=True #for code generation.
+        
+        if args.sdf_mode:
+            self.decoder.cos_anneal_ratio = min(1, self.global_step / (0.5 * (args.n_iters // 5) ))
+            self.decoder.normal_anneal_epsilon = 1e-1 * (1 - min(0.999, self.global_step / (0.5 * (args.n_iters // 5))))
 
         # ==== optimize code ====
         cond_imgs = data['cond_imgs']  # (num_scenes, num_imgs, h, w, 3)
         cond_intrinsics = data['cond_intrinsics']  # (num_scenes, num_imgs, 4), in [fx, fy, cx, cy]
         cond_poses = data['cond_poses']
         cond_times = data.get('cond_times')
-
+        if args.enable_dense_depth:
+            cond_depth = data['cond_depth']
+        else:
+            cond_depth = None
         num_scenes, num_imgs, h, w, _ = cond_imgs.size()
         # (num_scenes, num_imgs, h, w, 3)
-        cond_rays_o, cond_rays_d = get_cam_rays(cond_poses, cond_intrinsics, h, w)
+        cond_rays_o, cond_rays_d = get_cam_rays(cond_poses, cond_intrinsics, h, w,rectify_convention=args.rectify_convention)
         dt_gamma_scale = self.train_cfg.get('dt_gamma_scale', 0.0)
         # (num_scenes,)
         dt_gamma = dt_gamma_scale / cond_intrinsics[..., :2].mean(dim=(-2, -1))
@@ -229,7 +245,7 @@ class MultiSceneNeRF(BaseNeRF):
 
         loss, log_vars, out_rgbs, target_rgbs = self.loss_decoder(
             self.decoder, code, density_bitfield, cond_rays_o, cond_rays_d,
-            cond_imgs, dt_gamma=dt_gamma, cond_times=cond_times, cfg=self.train_cfg,
+            cond_imgs, cond_depth=cond_depth, dt_gamma=dt_gamma, cond_times=cond_times, cfg=self.train_cfg,
             update_extra_state=self.update_extra_iters,
             extra_args=(density_grid, density_bitfield, 0),
             extra_kwargs=dict(

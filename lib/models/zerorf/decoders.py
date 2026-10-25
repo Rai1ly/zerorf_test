@@ -109,7 +109,7 @@ class CommonDecoder(nn.Module):
         if self.dir_net is not None:
             constant_init(self.dir_net, 0)
 
-    def forward(self, point_code, dirs, out_sdf=False):
+    def forward(self, point_code, dirs, out_sdf=True):
         base_x = self.base_net(point_code)
         base_x_act = self.base_activation(base_x)
         sigmas = self.density_net(base_x_act).squeeze(-1)
@@ -118,6 +118,8 @@ class CommonDecoder(nn.Module):
                 s = self.variance_act(10 * self.variance).clamp(1e-6, 1e6)
                 cov = self.variance_act(-s * sigmas).clamp(1e-6, 1e6)
                 sigmas = s * cov / (1 + cov) ** 2
+                # s = self.variance_act(self.variance * 10.0).clamp(1e-6, 1e6)
+                # sigmas = torch.sigmoid(-sigmas * s) * s
         if dirs is None:
             rgbs = None
         else:

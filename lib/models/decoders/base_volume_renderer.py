@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 from mmgen.models.builder import build_module
 from mmgen.models.architectures.common import get_module_device
 from mmcv.cnn import xavier_init, constant_init
@@ -57,6 +57,14 @@ class VolumeRenderer(nn.Module):
         aabb = torch.FloatTensor([-bound, -bound, -bound, bound, bound, bound])
         self.register_buffer('aabb', aabb)
 
+        self.global_step=0
+
+    # def get_masked_density_grid(self):
+    #     masked_coords = torch.tensor([-1, -1, -1, 1, 1, 1])
+
+
+    #     raise NotImplementedError
+
     def point_decode(self, xyzs, dirs, code):
         raise NotImplementedError
 
@@ -107,7 +115,7 @@ class VolumeRenderer(nn.Module):
             return self.code_proc_buffer
 
     def update_extra_state(self, code, density_grid, density_bitfield,
-                           iter_density, density_thresh=0.01, decay=0.9, S=128):
+                           iter_density, density_thresh=0.01, decay=0.9, S=128, limit_bound=False):
         code = self.preproc(code)
         if self.has_time_dynamics:
             decay = decay ** 0.5
@@ -120,6 +128,7 @@ class VolumeRenderer(nn.Module):
 
             # full update.
             if iter_density < 16:
+            # if self.global_step < 16:
                 X = torch.arange(grid_size, dtype=torch.int32, device=device).split(S)
                 Y = torch.arange(grid_size, dtype=torch.int32, device=device).split(S)
                 Z = torch.arange(grid_size, dtype=torch.int32, device=device).split(S)
@@ -131,19 +140,35 @@ class VolumeRenderer(nn.Module):
                             xx, yy, zz = custom_meshgrid(xs, ys, zs)
                             coords = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)],
                                                dim=-1)  # [N, 3], in [0, 128)
+                            
                             indices = morton3D(coords).long()  # [N]
                             xyzs = (coords.float() - (grid_size - 1) / 2) * (2 * self.bound / grid_size)
                             # add noise
                             half_voxel_width = self.bound / grid_size
                             xyzs += torch.rand_like(xyzs) * (2 * half_voxel_width) - half_voxel_width
-                            if self.has_time_dynamics:
-                                xyzs = torch.cat([xyzs, torch.rand_like(xyzs[..., :1])], dim=-1)
-                            # query density
-                            sigmas = self.point_density_decode(
-                                xyzs[None].expand(num_scenes, -1, 4 if self.has_time_dynamics else 3), code)[0].reshape(num_scenes, -1)  # (num_scenes, N)
-                            # assign
-                            tmp_grid[:, indices] = sigmas.clamp(
-                                max=torch.finfo(tmp_grid.dtype).max).to(tmp_grid.dtype)
+                            if limit_bound:
+                                x_bound, y_bound, z_bound = 0.5, 0.5, 0.5
+                                in_bound_mask = ((xyzs[:, 0] < x_bound) & (xyzs[:, 0] > -x_bound)) & \
+                                ((xyzs[:,1] < y_bound) & (xyzs[:, 1] > -y_bound)) & \
+                                ((xyzs[:, 2] < z_bound) & (xyzs[:, 2] > -z_bound))
+                                valid_xyzs = xyzs[in_bound_mask]
+                                valid_indices = indices[in_bound_mask]
+                                left_indices = indices[~in_bound_mask]
+                                sigmas = self.point_density_decode(
+                                    valid_xyzs[None].expand(num_scenes, -1, 4 if self.has_time_dynamics else 3), code)[0].reshape(num_scenes, -1)
+                                tmp_grid[:, valid_indices] = sigmas.clamp(
+                                    max=torch.finfo(tmp_grid.dtype).max).to(tmp_grid.dtype)
+                                tmp_grid[:, left_indices] = 0
+                                # print(valid_xyzs.shape)
+                            # if self.has_time_dynamics:
+                            #     xyzs = torch.cat([xyzs, torch.rand_like(xyzs[..., :1])], dim=-1)
+                            else:
+                                # query density
+                                sigmas = self.point_density_decode(
+                                    xyzs[None].expand(num_scenes, -1, 4 if self.has_time_dynamics else 3), code)[0].reshape(num_scenes, -1)  # (num_scenes, N)
+                                # assign
+                                tmp_grid[:, indices] = sigmas.clamp(
+                                    max=torch.finfo(tmp_grid.dtype).max).to(tmp_grid.dtype)
 
             # partial update (half the computation)
             else:
@@ -167,6 +192,9 @@ class VolumeRenderer(nn.Module):
                 half_voxel_width = self.bound / grid_size
                 xyzs += torch.rand_like(xyzs) * (2 * half_voxel_width) - half_voxel_width
                 sigmas = self.point_density_decode(xyzs, code)[0].reshape(num_scenes, -1)  # (num_scenes, N + N)
+                if self.sdf_mode:
+                    inv_s = torch.exp(self.common_decoder.variance * 10).clip(1e-6, 1e6)
+                    sigmas = torch.sigmoid(- sigmas * inv_s) * inv_s
                 # assign
                 tmp_grid[torch.arange(num_scenes, device=device)[:, None], indices] = sigmas.clamp(
                     max=torch.finfo(tmp_grid.dtype).max).to(tmp_grid.dtype)
@@ -177,6 +205,7 @@ class VolumeRenderer(nn.Module):
             # density_grid[valid_mask] = torch.maximum(density_grid[valid_mask] * decay, tmp_grid[valid_mask])
             mean_density = torch.mean(density_grid.clamp(min=0))  # -1 regions are viewed as 0 density.
             iter_density += 1
+            # self.global_step += 1
 
             # convert to bitfield
             density_thresh = min(mean_density, density_thresh)
@@ -273,39 +302,84 @@ class VolumeRenderer(nn.Module):
                     times_single = self.rays_to_points(len(xyzs_single), rays_single, rays_time_single)
                     xyzs_single = torch.cat([xyzs_single, times_single], dim=-1)
                 xyzs.append(xyzs_single)
+                #normalize dirctions.
+                # dirs_single = self.safe_normalize(dirs_single)
                 dirs.append(dirs_single)
                 ts.append(ts_single)
                 rays.append(rays_single)
-            if self.occlusion_culling_th > 0:
+            if self.occlusion_culling_th > 0 and (not self.sdf_mode):
                 with torch.no_grad():
                     sigmas, rgbs, num_points = self.point_decode(xyzs, None, code)
                 rgbs = sigmas.new_zeros(sigmas.shape[0], 3)
                 with torch.no_grad():
                     if sigmas.dtype != dtype or rgbs.dtype != dtype:
                         sigmas, rgbs = sigmas.to(dtype), rgbs.to(dtype)
-                    weights, weights_sum, depth, image = batch_composite_rays_train(sigmas, rgbs, ts, rays, num_points)
+                        if self.sdf_mode:
+                            inv_s = torch.exp(self.common_decoder.variance * 10).clip(1e-6, 1e6)
+                            raw_normal = self.normal(xyzs[0],code, self.normal_anneal_epsilon)
+                            normal = self.safe_normalize(raw_normal)
+                            true_cos = (dirs[0] * normal).sum(-1)
+                            iter_cos = -(F.relu(-true_cos * 0.5 + 0.5) * (1.0 - self.cos_anneal_ratio) + F.relu(-true_cos) * self.cos_anneal_ratio)
+                            estimated_prev_sdf = sigmas - iter_cos * ts[0][:, 1] * 0.5
+                            estimated_next_sdf = sigmas + iter_cos * ts[0][:, 1] * 0.5
+                            prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
+                            next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
+                            p = prev_cdf - next_cdf
+                            c = prev_cdf
+                            sigmas = ((p + 1e-5) / (c + 1e-5)).view(-1).clip(0, 1)#Convert sigmas 2 Alpha.
+                    weights, weights_sum, depth, image = batch_composite_rays_train(sigmas, rgbs, ts, rays, num_points, alpha_mode=self.sdf_mode)
                 occl = weights > self.occlusion_culling_th
                 ptr = 0
                 xyzs_filt = []
                 dirs_filt = []
                 occls_filt = []
-                for xyzs_single, dirs_single in zip(xyzs, dirs):
+                ts_filt = []
+                for xyzs_single, dirs_single, ts_single in zip(xyzs, dirs, ts):
                     blk = occl[ptr: ptr + len(xyzs_single)].nonzero().squeeze(-1)
                     ptr += len(xyzs_single)
                     xyzs_filt.append(xyzs_single[blk])
                     dirs_filt.append(dirs_single[blk])
+                    ts_filt.append(ts_single[blk])
                     occls_filt.append(blk)
                 sigmas_occl, rgbs_occl, _ = self.point_decode(xyzs_filt, dirs_filt, code)
                 sigmas = torch.zeros_like(sigmas)
                 occl = torch.cat(occls_filt)
                 sigmas[occl] = sigmas_occl
                 rgbs[occl] = rgbs_occl
+                if self.sdf_mode:
+                    inv_s = torch.exp(self.common_decoder.variance * 10).clip(1e-6, 1e6)
+                    raw_normal = self.normal(xyzs[0], code, self.normal_anneal_epsilon)
+                    results_temp_normal = raw_normal
+                    normal = self.safe_normalize(raw_normal)
+                    true_cos = (dirs[0] * normal).sum(-1)
+                    iter_cos = -(F.relu(-true_cos * 0.5 + 0.5)*(1.0 - self.cos_anneal_ratio) + F.relu(-true_cos) * self.cos_anneal_ratio)
+                    estimated_prev_sdf = sigmas - iter_cos * ts[0][:, 1] * 0.5
+                    estimated_next_sdf = sigmas + iter_cos * ts[0][:, 1] * 0.5
+                    prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
+                    next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
+                    p = prev_cdf - next_cdf
+                    c = prev_cdf
+                    sigmas = ((p + 1e-5) / (c + 1e-5)).view(-1).clip(0, 1)
                 if sigmas.dtype != dtype or rgbs.dtype != dtype:
                     sigmas, rgbs = sigmas.to(dtype), rgbs.to(dtype)
-                weights, weights_sum, depth, image = batch_composite_rays_train(sigmas, rgbs, ts, rays, num_points)
+                weights, weights_sum, depth, image = batch_composite_rays_train(sigmas, rgbs, ts, rays, num_points, alpha_mode=self.sdf_mode)
             else:
                 sigmas, rgbs, num_points = self.point_decode(xyzs, dirs, code)
-                weights, weights_sum, depth, image = batch_composite_rays_train(sigmas.to(dtype), rgbs.to(dtype), ts, rays, num_points)
+                if self.sdf_mode:
+                    inv_s = torch.exp(self.common_decoder.variance * 10).clip(1e-6, 1e6)
+                    raw_normal = self.normal(xyzs[0],code, self.normal_anneal_epsilon)
+                    results_temp_normal = raw_normal
+                    normal = self.safe_normalize(raw_normal)
+                    true_cos = (dirs[0] * normal).sum(-1)
+                    iter_cos = -(F.relu(-true_cos * 0.5 + 0.5) * (1.0 - self.cos_anneal_ratio) + F.relu(-true_cos) * self.cos_anneal_ratio)
+                    estimated_prev_sdf = sigmas - iter_cos * ts[0][:, 1] * 0.5
+                    estimated_next_sdf = sigmas + iter_cos * ts[0][:, 1] * 0.5
+                    prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
+                    next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
+                    p = prev_cdf - next_cdf
+                    c = prev_cdf
+                    sigmas = ((p + 1e-5) / (c + 1e-5)).view(-1).clip(0, 1) #Convert sigmas 2 Alpha.
+                weights, weights_sum, depth, image = batch_composite_rays_train(sigmas.to(dtype), rgbs.to(dtype), ts, rays, num_points, alpha_mode=self.sdf_mode)
 
         else:
             device = rays_o.device
@@ -348,11 +422,24 @@ class VolumeRenderer(nn.Module):
                         times = rays_time_single.repeat(1, n_step).reshape(-1, 1)
                         xyzs = torch.cat([xyzs, times], dim=-1)
                     sigmas, rgbs, _ = self.point_decode([xyzs], [dirs], code_single[None])
+                    if self.sdf_mode:
+                        inv_s = torch.exp(self.common_decoder.variance * 10).clip(1e-6, 1e6)
+                        raw_normal = self.normal(xyzs,code, self.normal_anneal_epsilon)
+                        results_temp_normal = raw_normal
+                        normal = self.safe_normalize(raw_normal)
+                        true_cos = - F.relu(-(dirs * normal).sum(-1))
+                        estimated_prev_sdf = sigmas - true_cos * ts[:, 1] * 0.5
+                        estimated_next_sdf = sigmas + true_cos * ts[:, 1] * 0.5
+                        prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
+                        next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
+                        p = prev_cdf - next_cdf
+                        c = prev_cdf
+                        sigmas = ((p + 1e-5) / (c + 1e-5)).view(-1).clip(0, 1) #Convert sigmas 2 Alpha.
                     if self.pre_gamma is not None:
                         rgbs = rgbs ** self.pre_gamma
                     composite_rays(
                         num_rays_alive, n_step, rays_alive, rays_t, sigmas.to(dtype), rgbs.to(dtype), ts,
-                        weights_sum_single, depth_single, image_single)
+                        weights_sum_single, depth_single, image_single, alpha_mode=self.sdf_mode)
                     if rays_time_single is not None:
                         rays_time_single = rays_time_single[rays_alive >= 0]
                     rays_alive = rays_alive[rays_alive >= 0]
@@ -362,22 +449,82 @@ class VolumeRenderer(nn.Module):
                 weights_sum.append(weights_sum_single)
                 depth.append(depth_single)
                 image.append(image_single)
-
-        results = dict(
-            weights=weights,
-            weights_sum=weights_sum,
-            depth=depth,
-            image=image,
-            sample_inds=sample_inds
-        )
-
+        if self.sdf_mode:
+            results = dict(
+                weights=weights,
+                weights_sum = weights_sum,
+                depth = depth,
+                image = image,
+                sample_inds = sample_inds,
+                normal = results_temp_normal
+            )
+        else:
+            results = dict(
+                weights=weights,
+                weights_sum=weights_sum,
+                depth=depth,
+                image=image,
+                sample_inds=sample_inds
+            )
         if return_loss:
             results.update(sigmas=sigmas, rgbs=rgbs)
             results.update(decoder_reg_loss=self.loss(results))
 
         return results
 
+    def init_double_sphere(self, r1=0.5, r2=1.5, iters=1000, batch_size=8192):
+        import tqdm
+        ### in decoders.py 
+        #  if self.preprocessor_needs_jit:
+        #     self.preprocessor_needs_jit = False
+        #     self.preprocessor = torch.jit.trace(self.preprocessor, self.code_buffer)
+        #  may go wrong. so 
+        self.preprocessor_needs_jit = False
+        code = self.preprocessor(None).to(torch.float32)
+        code = code.detach()
+        loss_fn = torch.nn.MSELoss()
+        optimizer = torch.optim.Adam(list(self.parameters()))
+        pbar = tqdm.trange(iters, bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+        for _ in range(iters):
+            xyzs = torch.rand(batch_size, 3, device='cuda') * 2 * self.bound - self.bound
+            d = torch.norm(xyzs, p=2, dim=-1)
+            gt_sdf = torch.where(d < (r1 + r2)/2, d - r1, r2-d )
+            pred_sdf = self.point_density_decode(xyzs[None],code)[0]
+            loss = loss_fn(pred_sdf, gt_sdf)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            pbar.set_description(f'pretrain sdf loss={loss.item():.8f}')
+            pbar.update(1)
+    
+    def normal(self, x, code, epsilon=1e-4):
+        # with torch.enable_grad():
+        #     x.requires_grad_(True)
+        #     sigma = self.point_density_decode(x[None], code)[0]
+        #     normal = torch.autograd.grad(
+        #         outputs=sigma,
+        #         inputs=x,
+        #         grad_outputs=torch.ones_like(sigma),
+        #         create_graph=True,
+        #         retain_graph=True
+        #     )[0]
+        dx_pos = self.point_density_decode((x + torch.tensor([[epsilon, 0.00, 0.00]], device=x.device))[None].clamp(-self.bound, self.bound), code)[0]
+        dx_neg = self.point_density_decode((x + torch.tensor([[-epsilon, 0.00, 0.00]], device=x.device))[None].clamp(-self.bound, self.bound), code)[0]
+        dy_pos = self.point_density_decode((x + torch.tensor([[0.00, epsilon, 0.00]], device=x.device))[None].clamp(-self.bound, self.bound), code)[0]
+        dy_neg = self.point_density_decode((x + torch.tensor([[0.00, -epsilon, 0.00]], device=x.device))[None].clamp(-self.bound, self.bound), code)[0]
+        dz_pos = self.point_density_decode((x + torch.tensor([[0.00, 0.00, epsilon]], device=x.device))[None].clamp(-self.bound, self.bound), code)[0]
+        dz_neg = self.point_density_decode((x + torch.tensor([[0.00, 0.00, -epsilon]], device=x.device))[None].clamp(-self.bound, self.bound), code)[0]
 
+        normal = torch.stack([
+            0.5 * (dx_pos - dx_neg) / epsilon,
+            0.5 * (dy_pos - dy_neg) / epsilon,
+            0.5 * (dz_pos - dz_neg) / epsilon
+        ], dim=-1
+        )
+        return normal
+    
+    def safe_normalize(self, x, eps=1e-20):
+        return x / torch.sqrt(torch.clamp(torch.sum(x * x, -1, keepdim=True), min=eps))
 class PointBasedVolumeRenderer(VolumeRenderer):
 
     def get_point_code(self, code, xyzs):
