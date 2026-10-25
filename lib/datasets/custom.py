@@ -282,7 +282,7 @@ class ColmapDataset(Dataset):
         self.world_scale = world_scale
         self.rgba = rgba
         self.split = split
-        self.downscale = 1
+        self.downscale = 3.57
         # load camera poses
         self.colmap_path = os.path.join(self.root_dir, "colmap_sparse", "0")
         if self.colmap_path is None:
@@ -419,12 +419,14 @@ class ColmapDataset(Dataset):
         self.images = []
         for i, f in enumerate(tqdm.tqdm(img_paths, desc=f'Loading {self.split} data')):
             # image = cv2.imread(f, cv2.IMREAD_UNCHANGED)
-            image = Image.open(f)
+            image = Image.open(f).convert("RGB")
+            image = image.resize((self.W, self.H), Image.Resampling.LANCZOS)
             image = self.transfrom(image) # [Channel=3, H, W]
             image = image.permute(1, 2, 0)
             if mask_paths is not None:
                 m_path = mask_paths[i]
                 mask = cv2.imread(m_path, cv2.IMREAD_UNCHANGED)
+                mask = cv2.resize(mask, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
                 mask = (mask / 255).astype(np.float32)
                 if len(mask.shape) == 2:
                     mask = mask[..., None]
