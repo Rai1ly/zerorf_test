@@ -21,6 +21,10 @@ def config_parser(cmd=None):
     parser.add_argument("--n-views", type=int, 
                         default=6, help='number of input views')
     parser.add_argument('--rectify_convention', action='store_true', help='if rectify the convention')
+    parser.add_argument('--test-every', type=int, default=10,
+                        help='for COLMAP, hold out every Nth image for testing')
+    parser.add_argument('--mesh-resolution', type=int, default=256,
+                        help='COLMAP final mesh voxel resolution (e.g. 256 or 384)')
     # model
     parser.add_argument("--model-res", type=int, 
                         default=20, help='noise resolution (should be about 1/40 the provided image resolution), ignored when load-image is set')

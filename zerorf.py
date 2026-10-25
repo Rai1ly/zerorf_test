@@ -104,15 +104,20 @@ if not args.load_image:
         selected_idxs = [i for i in range(args.n_views)]
     elif args.dataset == 'colmap':
         world_scale = 1.0
-        dataset = ColmapDataset(f"{args.data_dir}", split='train', world_scale=world_scale, rgba=True)
-        val = ColmapDataset(f"{args.data_dir}", split='val', world_scale=world_scale)
-        test = ColmapDataset(f"{args.data_dir}", split='val', world_scale=world_scale)
+        dataset = ColmapDataset(f"{args.data_dir}", split='train', world_scale=world_scale,
+                                rgba=True, test_every=args.test_every,
+                                load_depth=args.enable_dense_depth)
+        test = ColmapDataset(f"{args.data_dir}", split='test', world_scale=world_scale,
+                             test_every=args.test_every)
         entry = dataset[0]
         # if args.n_views==8:
         #     selected_idxs=[0,1,2,3,4,5,6,7]
         # else:
         #     selected_idxs = kmeans_downsample(entry['cond_poses'][...,:3,3], args.n_views)
-        selected_idxs = [i for i in range(16)]
+        # Number of train views cannot exceed the held-in training pool.
+        selected_idxs = list(range(min(args.n_views, len(entry['cond_imgs']))))
+        print(f'[COLMAP] use {len(selected_idxs)} training views (requested {args.n_views})')
+        args.n_views = len(selected_idxs)
     if args.enable_dense_depth:
         data_entry = dict(
             cond_imgs=torch.tensor(entry['cond_imgs'][selected_idxs][None]).float().to(device),
@@ -130,14 +135,16 @@ if not args.load_image:
             scene_id=[0],
             scene_name=[args.proj_name]
         )
-    entry = val[0]
-    val_entry = dict(
-        test_imgs=torch.tensor(entry['cond_imgs'][:args.n_val][None]).float().to(device),
-        test_poses=torch.tensor(entry['cond_poses'][:args.n_val])[None].float().to(device),
-        test_intrinsics=torch.tensor(entry['cond_intrinsics'][:args.n_val])[None].float().to(device),
-        scene_id=[0],
-        scene_name=[args.proj_name]
-    )
+    # No validation / model selection on held-out COLMAP test images.
+    if args.dataset != 'colmap':
+        entry = val[0]
+        val_entry = dict(
+            test_imgs=torch.tensor(entry['cond_imgs'][:args.n_val][None]).float().to(device),
+            test_poses=torch.tensor(entry['cond_poses'][:args.n_val])[None].float().to(device),
+            test_intrinsics=torch.tensor(entry['cond_intrinsics'][:args.n_val])[None].float().to(device),
+            scene_id=[0],
+            scene_name=[args.proj_name]
+        )
     entry = test[0]
     test_entry = dict(
         test_imgs=torch.tensor(entry['cond_imgs'][:][None]).float().to(device),
@@ -146,6 +153,15 @@ if not args.load_image:
         scene_id=[0],
         scene_name=[args.proj_name]
     )
+    if args.dataset == 'colmap':
+        with open('split.json', 'w', encoding='utf-8') as f:
+            json.dump({
+                'data_dir': args.data_dir,
+                'test_every': args.test_every,
+                'downscale': dataset.downscale,
+                'train_images': [dataset.image_names[i] for i in selected_idxs],
+                'test_images': test.image_names,
+            }, f, ensure_ascii=False, indent=2)
 else:
     data_entry = dict(
         cond_imgs=images,
@@ -249,7 +265,7 @@ nerf: MultiSceneNeRF = build_model(dict(
 test_cfg = dict(
     img_size=(pic_h, pic_w),
     density_thresh=0.01,
-    max_render_rays=4096,
+    max_render_rays=16384,
     dt_gamma_scale=0.5,
     n_inverse_rays=args.n_rays_init,
     loss_coef=0.1 / (pic_h * pic_w),
@@ -287,6 +303,34 @@ for j in prog:
     if j == 100:
         nerf.train_cfg['n_inverse_rays'] = args.n_rays_up
         nerf.train_cfg['n_decoder_rays'] = args.n_rays_up
+    # COLMAP: no 60-frame video, no repeated val/test, and no test-driven best selection.
+    # Train for the requested number of iterations, then test and mesh once.
+    if args.dataset == 'colmap':
+        if j == args.n_iters - 1:
+            torch.save(nerf.state_dict(), 'nerf-zerorf.pt')
+            nerf.eval()
+            scene_code = nerf.cache[0]['param']['code_'][None].to(device)
+            density_bitfield = nerf.cache[0]['param']['density_bitfield'][None].to(device)
+
+            with torch.no_grad():
+                test_metrics, _ = nerf.eval_and_viz(
+                    test_entry, nerf.decoder, scene_code, density_bitfield,
+                    viz_dir=None, cfg=nerf.test_cfg
+                )
+            print('[COLMAP] Final held-out test metrics:', test_metrics)
+            wandb.log(dict(test=test_metrics))
+            with open('test_metrics.json', 'w', encoding='utf-8') as f:
+                json.dump(test_metrics, f, indent=2)
+
+            # Export ONE scene mesh, not one mesh per held-out camera.
+            nerf.decoder.visualize_mesh = True
+            nerf.decoder.mesh_resolution = args.mesh_resolution
+            os.makedirs('mesh', exist_ok=True)
+            with torch.no_grad():
+                nerf.decoder.visualize(scene_code, [args.proj_name], 'mesh')
+            print(f'[COLMAP] Mesh saved: mesh/{args.proj_name}.glb')
+        continue
+
     if j % args.val_iter == args.val_iter - 1:
         cam = OrbitCamera('final', pic_w, pic_h, 3.2, 48)
         if args.dataset == 'custom':

@@ -3,6 +3,7 @@ from mmcv.parallel import DataContainer as DC
 from .colmap_utils import *
 from torch.utils.data import Dataset
 import os
+import re
 import json
 import numpy as np
 import torch
@@ -276,13 +277,16 @@ class CustomDataset(Dataset):
 
 @DATASETS.register_module()
 class ColmapDataset(Dataset):
-    def __init__(self, root_dir: str, split: str, world_scale: float = 1.0, rgba: bool = True):
+    def __init__(self, root_dir: str, split: str, world_scale: float = 1.0, rgba: bool = True, test_every: int = 10, load_depth: bool = False):
         super().__init__()
         self.root_dir = root_dir
         self.world_scale = world_scale
         self.rgba = rgba
         self.split = split
         self.downscale = 3.57
+        self.test_every = int(test_every)
+        if self.test_every < 2:
+            raise ValueError('test_every must be at least 2')
         # load camera poses
         self.colmap_path = os.path.join(self.root_dir, "colmap_sparse", "0")
         if self.colmap_path is None:
@@ -298,7 +302,12 @@ class ColmapDataset(Dataset):
 
         #read image paths
         imdata = read_images_binary(os.path.join(self.colmap_path, "images.bin"))
-        imkeys = np.array(sorted(imdata.keys()))
+        # Natural filename order: image2.png before image10.png.
+        def natural_image_key(k):
+            name = os.path.basename(imdata[k].name)
+            return tuple((0, int(t)) if t.isdigit() else (1, t.lower())
+                         for t in re.split(r'(\d+)', name))
+        imkeys = np.array(sorted(imdata.keys(), key=natural_image_key))
 
         img_names = [os.path.basename(imdata[k].name) for k in imkeys]
         img_folder = os.path.join(self.root_dir, "images")
@@ -310,10 +319,10 @@ class ColmapDataset(Dataset):
         img_paths = img_paths[exist_mask]
 
         # load mask folder
-        mask_folder = os.path.join(self.root_dir, 'mask')
+        mask_folder = os.path.join(self.root_dir, 'masks')
         if os.path.exists(mask_folder):
             print(f'[INFO] Use mask under folder {mask_folder}')
-            mask_paths = np.array([os.path.join(self.root_dir, 'mask', os.path.splitext(os.path.basename(p))[0] + '.png') for p in img_paths])
+            mask_paths = np.array([os.path.join(self.root_dir, 'masks', os.path.splitext(os.path.basename(p))[0] + '.png') for p in img_paths])
         else:
             mask_paths = None
         
@@ -374,46 +383,47 @@ class ColmapDataset(Dataset):
         self.pts3d *= self.scale
 
 
-        # make split
+        # Every test_every-th VALID image in filename order is held out.
+        # Zero based indices 9, 19,... when test_every=10.
         all_ids = np.arange(len(img_paths))
-        # This is the configuration for the duoji
-        val_ids = np.array([10, 13])
-        # This is the configuration for the motor_paper
-        # val_ids = np.array([6, 18, 17, 1, 12, 5])
-        # This is the configuration for the aniya
-        # val_ids = np.array([20, 10, 6, 11, 9, 4])
-        # This is the configuration for the model
-        # val_ids = np.array([6, 3, 9, 5, 13, 1])
-
+        test_ids = all_ids[self.test_every - 1::self.test_every]
+        if len(test_ids) == 0:
+            raise ValueError(f'COLMAP found {len(all_ids)} valid images, too few for test_every={self.test_every}')
+        train_ids = np.setdiff1d(all_ids, test_ids)
         if self.split == 'train':
-            train_ids = np.array([i for i in all_ids if i not in val_ids])
-            # This is the train idx for the duoji
-            self.poses = self.poses[train_ids]
-            self.intrinsics = self.intrinsics[train_ids]
-            img_paths = img_paths[train_ids]
-            if mask_paths is not None:
-                mask_paths = mask_paths[train_ids]
-            # Add depth info for train.
-            self.dense_depth_info = []
+            chosen_ids = train_ids
+        elif self.split in ('val', 'test'):
+            chosen_ids = test_ids
+        else:
+            raise ValueError(f'Unknown COLMAP split: {self.split}')
+
+        self.poses = self.poses[chosen_ids]
+        self.intrinsics = self.intrinsics[chosen_ids]
+        img_paths = img_paths[chosen_ids]
+        if mask_paths is not None:
+            mask_paths = mask_paths[chosen_ids]
+        self.image_names = [os.path.basename(p) for p in img_paths]
+        print(f'[COLMAP] {self.split}: {len(img_paths)} images, filenames: {self.image_names}')
+
+        # Depth is OPTIONAL. Only used if --enable_dense_depth is explicitly set.
+        self.dense_depth_info = None
+        if self.split == 'train' and load_depth:
             depth_folder = os.path.join(self.root_dir, 'depth')
-            if os.path.exists(depth_folder):
-                print(f'[INFO] use depth_Anything V2 under folder {depth_folder}')
-                depth_paths = np.array([os.path.join(self.root_dir, 'depth', os.path.splitext(os.path.basename(p))[0] + '.png') for p in img_paths])
-            else:
-                depth_paths = None
-            # load depth images.
-            for i, f in enumerate(tqdm.tqdm(depth_paths, desc=f'Loading depth data')):
-                depth_image = cv2.imread(f, cv2.IMREAD_UNCHANGED)
-                depth_image = depth_image[:, : , :1] / 255 # depth_image = depth_image / 255 or not?
-                self.dense_depth_info.append(depth_image)
-            self.dense_depth_info = torch.from_numpy(np.stack(self.dense_depth_info, axis=0))
-        elif self.split == 'val':
-            self.poses = self.poses[val_ids]
-            self.intrinsics = self.intrinsics[val_ids]
-            img_paths = img_paths[val_ids]
-            if mask_paths is not None:
-                mask_paths = mask_paths[val_ids]
-            self.dense_depth_info=None
+            if not os.path.isdir(depth_folder):
+                raise FileNotFoundError(f'Depth requested but directory is missing: {depth_folder}')
+            if os.path.isdir(depth_folder):
+                depth_images = []
+                for img_path in tqdm.tqdm(img_paths, desc='Loading depth data'):
+                    f = os.path.join(depth_folder, os.path.splitext(os.path.basename(img_path))[0] + '.png')
+                    dep = cv2.imread(f, cv2.IMREAD_UNCHANGED)
+                    if dep is None:
+                        raise FileNotFoundError(f'Cannot read depth file: {f}')
+                    if dep.ndim == 3:
+                        dep = dep[..., 0]
+                    dep = cv2.resize(dep, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
+                    depth_images.append((dep.astype(np.float32) / 255.0)[..., None])
+                self.dense_depth_info = torch.from_numpy(np.stack(depth_images, axis=0))
+
         # read images
         self.define_transforms()
         self.images = []
@@ -425,17 +435,18 @@ class ColmapDataset(Dataset):
             image = image.permute(1, 2, 0)
             if mask_paths is not None:
                 m_path = mask_paths[i]
-                mask = cv2.imread(m_path, cv2.IMREAD_UNCHANGED)
+                mask = cv2.imread(m_path, cv2.IMREAD_GRAYSCALE)
                 mask = cv2.resize(mask, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
-                mask = (mask / 255).astype(np.float32)
-                if len(mask.shape) == 2:
-                    mask = mask[..., None]
+                mask = torch.from_numpy(mask.astype(np.float32) / 255.0).unsqueeze(-1)
+                # mask = (mask / 255).astype(np.float32)
+                # if len(mask.shape) == 2:
+                #     mask = mask[..., None]
                 #blend A to RGB
-                mask = torch.from_numpy(mask)
+                # mask = torch.from_numpy(mask)
                 image = image * mask + (1 - mask)
 
                 if rgba:
-                    image = torch.cat([image, mask[..., :1]], dim=-1)
+                    image = torch.cat([image, mask], dim=-1)
             
             self.images.append(image)
 
@@ -456,7 +467,7 @@ class ColmapDataset(Dataset):
             scene_id=DC(index, cpu_only=True),
             scene_name=DC(self.root_dir, cpu_only=True),
             cond_imgs=np.array(self.images, np.float32),
-            cond_depth=np.array(self.dense_depth_info, np.float32),
+            cond_depth=None if self.dense_depth_info is None else np.array(self.dense_depth_info, np.float32),
             cond_poses=np.array(self.poses, np.float32),
             cond_intrinsics=np.array(self.intrinsics, np.float32)
         )

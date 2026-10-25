@@ -258,7 +258,8 @@ class TensorialDecoder(PointBasedVolumeRenderer):
             plotlib.imsave(os.path.join(viz_dir, "features-%s.png" % cfg), got)
         if not self.visualize_mesh:
             return
-        basis = torch.linspace(-1, 1, 500, device=code.device, dtype=code.dtype)
+        mesh_resolution = int(getattr(self, 'mesh_resolution', 256))
+        basis = torch.linspace(-1, 1, mesh_resolution, device=code.device, dtype=code.dtype)
         x, y, z = torch.meshgrid(basis, basis, basis, indexing='ij')
         xyz = torch.stack([x, y, z], dim=-1)
         xyz_f = xyz.flatten(0, -2)
@@ -280,7 +281,7 @@ class TensorialDecoder(PointBasedVolumeRenderer):
             verts, tris = mcubes.marching_cubes(field, 0.5)
         else:
             verts, tris = mcubes.marching_cubes(batches.numpy(), 0.0)
-        verts = verts / 250 - 1
+        verts = verts / (mesh_resolution - 1) * 2 - 1
         # mcubes.smooth()
         trimesh.Trimesh(verts, tris).export(os.path.join(viz_dir, str(scene_name[0]) + ".glb"))
 
@@ -336,7 +337,8 @@ class FreqFactorizedDecoder(TensorialDecoder):
         if not self.visualize_mesh:
             return
         buffer = self.code_proc_buffer.to(code)
-        basis = torch.linspace(-1, 1, 500, device=code.device, dtype=code.dtype)
+        mesh_resolution = int(getattr(self, 'mesh_resolution', 256))
+        basis = torch.linspace(-1, 1, mesh_resolution, device=code.device, dtype=code.dtype)
         x, y, z = torch.meshgrid(basis, basis, basis, indexing='ij')
         xyz = torch.stack([x, y, z], dim=-1)
         xyz_f = xyz.flatten(0, -2)
@@ -358,6 +360,6 @@ class FreqFactorizedDecoder(TensorialDecoder):
             verts, tris = mcubes.marching_cubes(field, 0.5)
         else:
             verts, tris = mcubes.marching_cubes(batches.numpy(), 0.0)
-        verts = verts / 250 - 1
+        verts = verts / (mesh_resolution - 1) * 2 - 1
         # mcubes.smooth()
         trimesh.Trimesh(verts, tris).export(os.path.join(viz_dir, str(scene_name[0]) + ".glb"))

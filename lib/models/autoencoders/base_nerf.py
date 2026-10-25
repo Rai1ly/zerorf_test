@@ -612,7 +612,12 @@ class BaseNeRF(nn.Module):
 
         if 'test_imgs' in data and not cfg.get('skip_eval', False):
             test_imgs = data['test_imgs']  # (num_scenes, num_imgs, h, w, 3) or # (num_scenes. num_images, h, w, 4) for the customdataset.
-            test_imgs = test_imgs[..., :3]
+            # test_imgs = test_imgs[..., :3]
+            if test_imgs.shape[-1] == 4:
+                alpha = test_imgs[..., 3:4]
+                test_imgs = test_imgs[..., :3] * alpha + (1.0 - alpha)
+            else:
+                test_imgs = test_imgs[..., :3]
             _, _, h, w, _ = test_imgs.size()
             # for the test usage, drop the mask dimention of the image.
 
