@@ -27,6 +27,33 @@ from pprint import pprint
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
+
+def export_colmap_view(view_dir, basename, prediction, target):
+    """Write prediction, white-composited GT, mask and side-by-side PNGs."""
+    from pathlib import Path
+    folder = Path(view_dir)
+    folder.mkdir(parents=True, exist_ok=True)
+    pred = prediction.detach().float().clamp(0, 1).cpu()
+    gt = target.detach().float().cpu()
+    if gt.shape[-1] == 4:
+        alpha = gt[..., 3:4].clamp(0, 1)
+        gt_rgb = gt[..., :3] * alpha + (1.0 - alpha)
+    else:
+        alpha = None
+        gt_rgb = gt[..., :3]
+    def uint8_image(x):
+        return (x.clamp(0, 1).numpy() * 255.0 + 0.5).astype(numpy.uint8)
+    pred_img = uint8_image(pred)
+    gt_img = uint8_image(gt_rgb)
+    Image.fromarray(pred_img, 'RGB').save(folder / f'{basename}_pred.png')
+    Image.fromarray(gt_img, 'RGB').save(folder / f'{basename}_gt.png')
+    Image.fromarray(numpy.concatenate([gt_img, pred_img], axis=1), 'RGB').save(
+        folder / f'{basename}_comparison.png')
+    if alpha is not None:
+        Image.fromarray(uint8_image(alpha.squeeze(-1)), 'L').save(
+            folder / f'{basename}_mask.png')
+
+
 def kmeans_downsample(points, n_points_to_sample):
     kmeans = KMeans(n_points_to_sample).fit(points)
     return ((points - kmeans.cluster_centers_[..., None, :]) ** 2).sum(-1).argmin(-1).tolist()
@@ -312,11 +339,42 @@ for j in prog:
             scene_code = nerf.cache[0]['param']['code_'][None].to(device)
             density_bitfield = nerf.cache[0]['param']['density_bitfield'][None].to(device)
 
+            # Evaluate the held-out test set exactly once; reuse the predictions.
             with torch.no_grad():
-                test_metrics, _ = nerf.eval_and_viz(
+                test_metrics, test_pred = nerf.eval_and_viz(
                     test_entry, nerf.decoder, scene_code, density_bitfield,
                     viz_dir=None, cfg=nerf.test_cfg
                 )
+                for i, filename in enumerate(test.image_names):
+                    basename = os.path.splitext(filename)[0]
+                    export_colmap_view(
+                        'viz/test', basename,
+                        test_pred[0, i].permute(1, 2, 0),
+                        test_entry['test_imgs'][0, i]
+                    )
+                del test_pred
+
+                # One training view at a time to avoid a large VRAM spike.
+                # This is image export only, NOT an extra metric evaluation.
+                train_cfg = dict(nerf.test_cfg)
+                train_cfg['return_rgba'] = False
+                for i, filename in enumerate(tqdm.tqdm(
+                        [dataset.image_names[k] for k in selected_idxs],
+                        desc='Export train views')):
+                    rendered, _ = nerf.render(
+                        nerf.decoder, scene_code, density_bitfield,
+                        pic_h, pic_w,
+                        data_entry['cond_intrinsics'][:, i:i + 1],
+                        data_entry['cond_poses'][:, i:i + 1],
+                        None, train_cfg
+                    )
+                    basename = os.path.splitext(filename)[0]
+                    export_colmap_view(
+                        'viz/train', basename,
+                        rendered[0, 0], data_entry['cond_imgs'][0, i]
+                    )
+                    del rendered
+            print('[COLMAP] Train/Test RGB, masks and comparisons saved in viz/.')
             print('[COLMAP] Final held-out test metrics:', test_metrics)
             wandb.log(dict(test=test_metrics))
             with open('test_metrics.json', 'w', encoding='utf-8') as f:

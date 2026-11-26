@@ -320,9 +320,15 @@ class ColmapDataset(Dataset):
 
         # load mask folder
         mask_folder = os.path.join(self.root_dir, 'masks')
-        if os.path.exists(mask_folder):
-            print(f'[INFO] Use mask under folder {mask_folder}')
-            mask_paths = np.array([os.path.join(self.root_dir, 'masks', os.path.splitext(os.path.basename(p))[0] + '.png') for p in img_paths])
+        if os.path.isdir(mask_folder):
+            print(f'[INFO] Use foreground masks under folder {mask_folder}')
+            mask_paths = np.array([
+                os.path.join(mask_folder, os.path.splitext(os.path.basename(p))[0] + '.png')
+                for p in img_paths
+            ])
+        elif rgba:
+            raise FileNotFoundError(
+                f'COLMAP RGBA requires foreground masks in {mask_folder}')
         else:
             mask_paths = None
         
@@ -435,18 +441,18 @@ class ColmapDataset(Dataset):
             image = image.permute(1, 2, 0)
             if mask_paths is not None:
                 m_path = mask_paths[i]
+                # A black/white segmentation PNG, not the PNG's alpha channel.
+                # Assumes white = foreground, black = background.
                 mask = cv2.imread(m_path, cv2.IMREAD_GRAYSCALE)
+                if mask is None:
+                    raise FileNotFoundError(f'Cannot read COLMAP mask: {m_path}')
                 mask = cv2.resize(mask, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
                 mask = torch.from_numpy(mask.astype(np.float32) / 255.0).unsqueeze(-1)
-                # mask = (mask / 255).astype(np.float32)
-                # if len(mask.shape) == 2:
-                #     mask = mask[..., None]
-                #blend A to RGB
-                # mask = torch.from_numpy(mask)
-                image = image * mask + (1 - mask)
-
                 if rgba:
+                    # Keep uncomposited RGB and alpha; BaseNeRF.loss() composites once.
                     image = torch.cat([image, mask], dim=-1)
+                else:
+                    image = image * mask + (1.0 - mask)
             
             self.images.append(image)
 
